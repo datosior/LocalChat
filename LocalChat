@@ -1,0 +1,952 @@
+
+"""LocalChat: отдельный Tkinter-чат для локального LM Studio."""
+from __future__ import annotations
+
+import ast
+import difflib
+import io
+import json
+import os
+from pathlib import Path
+import queue
+import re
+import socket
+import tempfile
+import threading
+import time
+import tkinter as tk
+from tkinter import filedialog, messagebox, scrolledtext, ttk
+import tokenize
+from urllib.error import HTTPError, URLError
+from urllib.request import (
+    Request, ProxyHandler, HTTPRedirectHandler, build_opener,
+)
+
+VERSION = "1.2"
+API = "http://127.0.0.1:1234/v1"
+MAX_API_BYTES = 15_000_000
+MAX_CODE_CHARS = 80_000
+MAX_HISTORY_MESSAGES = 12
+MAX_REPLY_TOKENS = 8192
+MODEL_LIST_TIMEOUT = 30
+DEFAULT_CHAT_TIMEOUT = 600
+
+# Измени в интерфейсе под настройки загруженной модели.
+DEFAULT_CONTEXT_WINDOW = 32768
+
+APP_DIR = Path(__file__).resolve().parent
+CHAT_DIR = APP_DIR / "Chats"
+
+BEGIN = "<<<BEGIN_PYTHON>>>"
+END = "<<<END_PYTHON>>>"
+SYSTEM_PROMPT = (
+    "Ты локальный помощник. Отвечай на русском языке, ясно и точно. "
+    "Когда обсуждается Python, сохраняй смысл исходного кода "
+    "и математические формулы. "
+    "Не утверждай, что запускал код или изменял файлы, если это не так."
+)
+
+
+class NoRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise RuntimeError("Редирект локального LM Studio запрещён")
+
+
+HTTP = build_opener(ProxyHandler({}), NoRedirect())
+
+
+def request_local(endpoint, payload=None, timeout=120):
+    if endpoint not in ("/models", "/chat/completions"):
+        raise ValueError("Неверный путь API")
+
+    data = (
+        None if payload is None
+        else json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    )
+    req = Request(
+        API + endpoint,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST" if data is not None else "GET",
+    )
+    try:
+        with HTTP.open(req, timeout=timeout) as response:
+            header = response.headers.get("Content-Length")
+            if header and header.isdecimal() and int(header) > MAX_API_BYTES:
+                raise RuntimeError("Ответ модели слишком большой")
+
+            raw = response.read(MAX_API_BYTES + 1)
+            if len(raw) > MAX_API_BYTES:
+                raise RuntimeError("Ответ модели слишком большой")
+
+            result = json.loads(raw.decode("utf-8-sig"))
+            if not isinstance(result, dict):
+                raise ValueError("Некорректный JSON от LM Studio")
+            return result
+    except HTTPError as exc:
+        try:
+            details = exc.read(600).decode("utf-8", "replace")
+        finally:
+            exc.close()
+        raise RuntimeError(
+            f"LM Studio вернул HTTP {exc.code}: {details}"
+        ) from exc
+    except (socket.timeout, TimeoutError) as exc:
+        raise RuntimeError(
+            f"LM Studio не ответил за {timeout} секунд на запрос {endpoint}. "
+            "Сервер может быть занят загрузкой или генерацией модели."
+        ) from exc
+    except URLError as exc:
+        reason = getattr(exc, "reason", exc)
+        if isinstance(reason, (socket.timeout, TimeoutError)) or "timed out" in str(reason).lower():
+            raise RuntimeError(
+                f"LM Studio не ответил вовремя ({endpoint}, ожидание {timeout} сек.). "
+                "Возможно, сервер занят моделью."
+            ) from exc
+        raise RuntimeError(
+            f"Нет соединения с LM Studio ({endpoint}): {reason}. "
+            "Проверь Developer → Start Server и порт 1234."
+        ) from exc
+    except OSError as exc:
+        raise RuntimeError(
+            f"Ошибка локального соединения с LM Studio ({endpoint}): {exc}"
+        ) from exc
+
+
+def available_models():
+    data = request_local("/models", timeout=MODEL_LIST_TIMEOUT)
+    models = data.get("data")
+    if not isinstance(models, list):
+        raise RuntimeError("LM Studio не вернул список моделей")
+
+    ids = []
+    for item in models:
+        if isinstance(item, dict) and isinstance(item.get("id"), str):
+            if item["id"] and item["id"] not in ids:
+                ids.append(item["id"])
+    return ids
+
+
+def model_reply(model, messages, temperature=0.3, timeout=DEFAULT_CHAT_TIMEOUT):
+    started = time.perf_counter()
+    data = request_local("/chat/completions", {
+        "model": model,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": MAX_REPLY_TOKENS,
+        "stream": False,
+    }, timeout=timeout)
+    elapsed = time.perf_counter() - started
+
+    choices = data.get("choices")
+    if (
+        not isinstance(choices, list)
+        or not choices
+        or not isinstance(choices[0], dict)
+    ):
+        raise RuntimeError("Пустой ответ LM Studio")
+
+    choice = choices[0]
+    msg = choice.get("message")
+    content = msg.get("content") if isinstance(msg, dict) else None
+    if isinstance(content, list):
+        content = "\n".join(
+            x["text"] for x in content
+            if isinstance(x, dict) and isinstance(x.get("text"), str)
+        )
+    if not isinstance(content, str) or not content.strip():
+        raise RuntimeError("Модель вернула пустой ответ")
+
+    usage = data.get("usage")
+    if not isinstance(usage, dict):
+        usage = {}
+
+    return {
+        "answer": content,
+        "usage": usage,
+        "elapsed": elapsed,
+        "truncated": choice.get("finish_reason") == "length",
+    }
+
+
+def load_python(path):
+    """Возвращает текст, исходные байты и кодировку."""
+    raw = path.read_bytes()
+    if len(raw) > 1_500_000:
+        raise ValueError("Файл слишком большой для чата (больше 1.5 МБ)")
+    encoding, _ = tokenize.detect_encoding(io.BytesIO(raw).readline)
+    return raw.decode(encoding), raw, encoding
+
+
+def extract_fixed_code(answer, original):
+    pattern = (
+        r"(?ms)^" + re.escape(BEGIN)
+        + r"[ \t]*\r?\n(.*?)^" + re.escape(END)
+        + r"[ \t]*(?:\r?\n|\Z)"
+    )
+    matches = list(re.finditer(pattern, answer))
+    if len(matches) != 1:
+        raise ValueError(
+            "Модель не вернула один полный файл между маркерами. "
+            "Правки не применены."
+        )
+
+    result = matches[0].group(1)
+    if not original.endswith(("\r", "\n")):
+        result = result.removesuffix("\n").removesuffix("\r")
+
+    if "\r\n" in original and original.count("\n") == original.count("\r\n"):
+        result = result.replace("\r\n", "\n").replace("\n", "\r\n")
+
+    ast.parse(result)
+    return result
+
+
+def safe_write_with_backup(path, original_raw, candidate, encoding):
+    """Создаёт резервную копию перед заменой файла."""
+    if path.read_bytes() != original_raw:
+        raise RuntimeError("Файл изменён после запроса. Запись отменена.")
+
+    new_bytes = candidate.encode(encoding)
+    backup_dir = Path.home() / "LocalChat_Backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    backup = backup_dir / (
+        f"{path.name}.{stamp}.{time.time_ns() % 1_000_000_000}.bak"
+    )
+    with backup.open("xb") as stream:
+        stream.write(original_raw)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+    temp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "wb", dir=path.parent,
+            prefix=f".{path.name}.localchat_",
+            suffix=".tmp", delete=False,
+        ) as stream:
+            temp_path = Path(stream.name)
+            stream.write(new_bytes)
+            stream.flush()
+            os.fsync(stream.fileno())
+
+        try:
+            os.chmod(temp_path, path.stat().st_mode)
+        except OSError:
+            pass
+
+        if path.read_bytes() != original_raw:
+            raise RuntimeError("Файл изменился перед записью. Запись отменена.")
+
+        os.replace(temp_path, path)
+        temp_path = None
+        return backup
+    finally:
+        if temp_path is not None:
+            temp_path.unlink(missing_ok=True)
+
+
+class LocalChat:
+    def __init__(self, root):
+        self.root = root
+        root.title(f"LocalChat {VERSION} — LM Studio")
+        root.geometry("1050x740")
+        root.minsize(760, 500)
+        root.protocol("WM_DELETE_WINDOW", self.close)
+
+        self.queue = queue.Queue()
+        self.busy = False
+        self.closed = False
+        self.generation = 0
+        self.history = []
+        self.messages = []
+        self.last_answer = ""
+        self.file_path = None
+        self.context_message = ""
+        self.last_stats = None
+
+        self.model_var = tk.StringVar()
+        self.timeout_var = tk.StringVar(value="10 мин")
+        self.file_var = tk.StringVar(value="Файл не выбран")
+        self.status_var = tk.StringVar(value="Подключение к LM Studio...")
+        self.attach_var = tk.BooleanVar(value=False)
+        self.context_var = tk.StringVar(value=str(DEFAULT_CONTEXT_WINDOW))
+        self.stats_var = tk.StringVar(value=self._empty_stats())
+
+        self._make_ui()
+        self.context_var.trace_add("write", self._context_changed)
+        self.models.bind("<<ComboboxSelected>>", self._model_changed)
+
+        self._add_message(
+            "Система", "Сервер: 127.0.0.1:1234. История: последние 12 сообщений."
+        )
+        root.after(90, self._poll)
+        self.refresh_models()
+
+    def _empty_stats(self):
+        return "Скорость: — | Вход: — | Ответ: — | Контекст: —"
+
+    def _make_ui(self):
+        top = ttk.Frame(self.root, padding=8)
+        top.pack(fill="x")
+        ttk.Label(top, text="Модель:").pack(side="left")
+        self.models = ttk.Combobox(
+            top, textvariable=self.model_var, width=32, state="readonly"
+        )
+        self.models.pack(side="left", fill="x", expand=True, padx=7)
+        for text, command in (
+            ("Обновить", self.refresh_models),
+            ("Новый чат", self.new_chat),
+            ("Сохранить чат", self.save_chat),
+        ):
+            ttk.Button(top, text=text, command=command).pack(
+                side="left", padx=3
+            )
+
+        settings = ttk.Frame(self.root, padding=(8, 0, 8, 5))
+        settings.pack(fill="x")
+        ttk.Label(settings, text="Контекст в LM Studio:").pack(side="left")
+        ttk.Entry(
+            settings, textvariable=self.context_var, width=10
+        ).pack(side="left", padx=6)
+        ttk.Label(
+            settings,
+            text=f"токенов    |    Максимум ответа: {MAX_REPLY_TOKENS}",
+        ).pack(side="left")
+        ttk.Label(settings, text="  Ожидание ответа:").pack(side="left", padx=(12, 3))
+        ttk.Combobox(
+            settings, textvariable=self.timeout_var, width=8, state="readonly",
+            values=("2 мин", "5 мин", "10 мин", "20 мин", "30 мин"),
+        ).pack(side="left")
+
+        ttk.Label(
+            self.root, textvariable=self.stats_var,
+            anchor="w", wraplength=1000,
+        ).pack(fill="x", padx=8, pady=(0, 7))
+
+        file_row = ttk.Frame(self.root, padding=(8, 0, 8, 5))
+        file_row.pack(fill="x")
+        ttk.Button(
+            file_row, text="Выбрать .py...", command=self.choose_file
+        ).pack(side="left")
+        ttk.Label(
+            file_row, textvariable=self.file_var
+        ).pack(side="left", padx=7, fill="x", expand=True)
+        ttk.Checkbutton(
+            file_row, text="Добавлять код к вопросу",
+            variable=self.attach_var,
+        ).pack(side="right")
+
+        self.log = scrolledtext.ScrolledText(
+            self.root, wrap="word", font=("Consolas", 10),
+            state="disabled", exportselection=False,
+        )
+        self.log.pack(fill="both", expand=True, padx=8, pady=(0, 4))
+        self.log.tag_configure("speaker", font=("Segoe UI", 10, "bold"))
+
+        self.log_menu = tk.Menu(self.log, tearoff=False)
+        for text, command in (
+            ("Копировать выделенное", lambda: self.copy(self.selected(self.log))),
+            ("Копировать сообщение", lambda: self.copy(self.context_message)),
+            ("Копировать ответ", lambda: self.copy(self.last_answer)),
+            ("Копировать весь чат", self.copy_chat),
+        ):
+            self.log_menu.add_command(label=text, command=command)
+        self.log.bind("<Button-3>", self._log_rightclick)
+        for key in ("<Control-c>", "<Control-C>", "<Control-Insert>"):
+            self.log.bind(key, lambda e: self._copy_widget(self.log))
+        for key in ("<Control-a>", "<Control-A>"):
+            self.log.bind(key, lambda e: self._select_all(self.log))
+
+        actions = ttk.Frame(self.root, padding=(8, 2))
+        actions.pack(fill="x")
+        ttk.Button(
+            actions, text="Копировать ответ",
+            command=lambda: self.copy(self.last_answer),
+        ).pack(side="left", padx=(0, 5))
+        ttk.Button(
+            actions, text="Копировать чат", command=self.copy_chat
+        ).pack(side="left")
+        ttk.Button(
+            actions, text="Исправить .py по запросу",
+            command=self.fix_from_chat,
+        ).pack(side="right")
+
+        self.input = tk.Text(
+            self.root, height=6, undo=True, wrap="word",
+            font=("Segoe UI", 11), exportselection=False,
+        )
+        self.input.pack(fill="x", padx=8, pady=4)
+        self.input_menu = tk.Menu(self.input, tearoff=False)
+        for text, command in (
+            ("Копировать", lambda: self.copy(self.selected(self.input))),
+            ("Вырезать", self._cut),
+            ("Вставить", self._paste),
+            ("Выделить всё", lambda: self._select_all(self.input)),
+        ):
+            self.input_menu.add_command(label=text, command=command)
+        self.input.bind("<Button-3>", self._input_rightclick)
+        for key in ("<Control-v>", "<Control-V>", "<Shift-Insert>"):
+            self.input.bind(key, self._paste)
+        for key in ("<Control-c>", "<Control-C>", "<Control-Insert>"):
+            self.input.bind(key, lambda e: self._copy_widget(self.input))
+        for key in ("<Control-x>", "<Control-X>", "<Shift-Delete>"):
+            self.input.bind(key, self._cut)
+        for key in ("<Control-a>", "<Control-A>"):
+            self.input.bind(key, lambda e: self._select_all(self.input))
+        self.input.bind("<Control-Return>", self._send_and_break)
+
+        bottom = ttk.Frame(self.root, padding=8)
+        bottom.pack(fill="x")
+        ttk.Label(
+            bottom, textvariable=self.status_var, wraplength=650
+        ).pack(side="left", fill="x", expand=True)
+        ttk.Button(
+            bottom, text="Вставить", command=self._paste
+        ).pack(side="right", padx=4)
+        self.send_button = ttk.Button(
+            bottom, text="Отправить (Ctrl+Enter)", command=self.send
+        )
+        self.send_button.pack(side="right")
+
+    def _context_changed(self, *args):
+        if self.last_stats is not None:
+            self._update_stats(self.last_stats)
+
+    def _model_changed(self, event=None):
+        self.last_stats = None
+        self.stats_var.set(self._empty_stats())
+        self.status_var.set("Проверь размер контекста выбранной модели")
+
+    def _update_stats(self, result):
+        self.last_stats = result
+        usage = result["usage"]
+
+        def count(name):
+            value = usage.get(name)
+            if type(value) is int and value >= 0:
+                return value
+            return None
+
+        incoming = count("prompt_tokens")
+        outgoing = count("completion_tokens")
+        total = count("total_tokens")
+        if total is None and incoming is not None and outgoing is not None:
+            total = incoming + outgoing
+
+        elapsed = result["elapsed"]
+        speed = (
+            f"≈{outgoing / elapsed:.1f} ток/с"
+            if outgoing is not None and elapsed > 0 else "нет данных"
+        )
+        parts = [
+            f"Скорость за запрос: {speed}",
+            f"Вход: {incoming if incoming is not None else '—'}",
+            f"Ответ: {outgoing if outgoing is not None else '—'}",
+        ]
+
+        try:
+            limit = int(self.context_var.get())
+            if limit <= 0:
+                raise ValueError
+        except ValueError:
+            parts.append("Контекст: укажи положительное целое число")
+        else:
+            if total is None:
+                parts.append("Контекст: сервер не передал usage")
+            else:
+                free = max(0, limit - total)
+                parts.append(f"Занято: {total}/{limit}")
+                parts.append(f"Свободно после ответа: ≈{free}")
+                if total > limit:
+                    parts.append("Проверь указанный размер контекста")
+
+        self.stats_var.set(" | ".join(parts))
+
+    def selected(self, widget):
+        try:
+            return widget.get("sel.first", "sel.last")
+        except tk.TclError:
+            return ""
+
+    def copy(self, value):
+        if not value:
+            return False
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(value)
+            self.root.update_idletasks()
+            return True
+        except tk.TclError as exc:
+            messagebox.showerror("Буфер обмена", str(exc), parent=self.root)
+            return False
+
+    def _copy_widget(self, widget):
+        self.copy(self.selected(widget))
+        return "break"
+
+    def _paste(self, event=None):
+        try:
+            content = self.root.clipboard_get()
+        except tk.TclError:
+            self.status_var.set("В буфере нет текста")
+            return "break"
+        if content:
+            self.input.edit_separator()
+            if self.input.tag_ranges("sel"):
+                self.input.delete("sel.first", "sel.last")
+            self.input.insert("insert", content)
+            self.input.edit_separator()
+            self.status_var.set("Вставлено")
+        return "break"
+
+    def _cut(self, event=None):
+        value = self.selected(self.input)
+        if value and self.copy(value):
+            self.input.edit_separator()
+            self.input.delete("sel.first", "sel.last")
+            self.input.edit_separator()
+        return "break"
+
+    def _select_all(self, widget):
+        widget.tag_add("sel", "1.0", "end-1c")
+        widget.mark_set("insert", "end-1c")
+        return "break"
+
+    def _input_rightclick(self, event):
+        state = "normal" if self.selected(self.input) else "disabled"
+        for label in ("Копировать", "Вырезать"):
+            self.input_menu.entryconfigure(label, state=state)
+        try:
+            self.input_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.input_menu.grab_release()
+        return "break"
+
+    def _log_rightclick(self, event):
+        idx = self.log.index(f"@{event.x},{event.y}")
+        self.context_message = ""
+        for tag, author, content in self.messages:
+            if tag in self.log.tag_names(idx):
+                self.context_message = content
+                break
+        for label, enabled in (
+            ("Копировать выделенное", bool(self.selected(self.log))),
+            ("Копировать сообщение", bool(self.context_message)),
+            ("Копировать ответ", bool(self.last_answer)),
+        ):
+            self.log_menu.entryconfigure(
+                label, state="normal" if enabled else "disabled"
+            )
+        try:
+            self.log_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.log_menu.grab_release()
+        return "break"
+
+    def _add_message(self, author, content):
+        tag = f"message_{len(self.messages)}"
+        self.log.configure(state="normal")
+        self.log.insert("end", author + ":\n", ("speaker",))
+        start = self.log.index("end-1c")
+        self.log.insert("end", content)
+        self.log.tag_add(tag, start, self.log.index("end-1c"))
+        self.log.insert("end", "\n\n")
+        self.log.configure(state="disabled")
+        self.log.see("end")
+        self.messages.append((tag, author, content))
+        if author == "Local AI":
+            self.last_answer = content
+
+    def copy_chat(self):
+        self.copy(self.log.get("1.0", "end-1c"))
+
+    def save_chat(self):
+        try:
+            CHAT_DIR.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            messagebox.showerror(
+                "Сохранение",
+                f"Не удалось создать папку:\n{CHAT_DIR}\n\n{exc}",
+                parent=self.root,
+            )
+            return
+
+        destination = filedialog.asksaveasfilename(
+            parent=self.root,
+            title="Сохранить переписку",
+            initialdir=str(CHAT_DIR),
+            initialfile=time.strftime("LocalChat_%Y-%m-%d_%H-%M-%S.txt"),
+            defaultextension=".txt",
+            filetypes=[("Текст", "*.txt"), ("Все файлы", "*.*")],
+        )
+        if not destination:
+            return
+
+        try:
+            Path(destination).write_text(
+                self.log.get("1.0", "end-1c"), encoding="utf-8"
+            )
+            self.status_var.set(f"Чат сохранён: {destination}")
+        except OSError as exc:
+            messagebox.showerror("Сохранение", str(exc), parent=self.root)
+
+    def choose_file(self):
+        filename = filedialog.askopenfilename(
+            parent=self.root, title="Выбрать Python-файл",
+            filetypes=[("Python", "*.py"), ("Все файлы", "*.*")],
+        )
+        if filename:
+            self.file_path = Path(filename)
+            self.file_var.set(str(self.file_path))
+            self.attach_var.set(True)
+            self.status_var.set("Файл выбран; исходник прочитается перед запросом")
+
+    def new_chat(self):
+        self.generation += 1
+        self.history.clear()
+        self.messages.clear()
+        self.last_answer = ""
+        self.last_stats = None
+        self.stats_var.set(self._empty_stats())
+        self.log.configure(state="normal")
+        self.log.delete("1.0", "end")
+        self.log.configure(state="disabled")
+        self._add_message("Система", "Новый разговор. LM Studio: 127.0.0.1:1234")
+        self.status_var.set(
+            "Старый запрос ещё выполняется" if self.busy else "Новый диалог"
+        )
+
+    def _background(self, action, finished):
+        if self.busy:
+            self.status_var.set("Дождись завершения предыдущего запроса")
+            return False
+        self.busy = True
+        self.send_button.configure(state="disabled")
+        self.models.configure(state="disabled")
+
+        def worker():
+            try:
+                value, err = action(), None
+            except Exception as exc:
+                value, err = None, f"{type(exc).__name__}: {exc}"
+            self.queue.put((finished, value, err))
+
+        threading.Thread(
+            target=worker, name="LocalChat-Worker", daemon=True
+        ).start()
+        return True
+
+    def _poll(self):
+        if self.closed:
+            return
+        while True:
+            try:
+                callback, value, err = self.queue.get_nowait()
+            except queue.Empty:
+                break
+            self.busy = False
+            self.send_button.configure(state="normal")
+            self.models.configure(state="readonly")
+            try:
+                callback(value, err)
+            except Exception as exc:
+                messagebox.showerror(
+                    "LocalChat", f"Ошибка интерфейса: {exc}", parent=self.root
+                )
+        self.root.after(90, self._poll)
+
+    def refresh_models(self):
+        if self.busy:
+            self.status_var.set("Запрос ещё выполняется")
+            return
+        self.status_var.set(f"Поиск моделей LM Studio (до {MODEL_LIST_TIMEOUT} сек)...")
+
+        def finished(models, err):
+            if err:
+                self.status_var.set("Не удалось получить список моделей. Нажми «Обновить» снова.")
+                messagebox.showwarning(
+                    "Подключение",
+                    err + "\n\nПроверь в браузере: http://127.0.0.1:1234/v1/models",
+                    parent=self.root,
+                )
+                return
+            self.models["values"] = models
+            if self.model_var.get() not in models:
+                self.model_var.set(models[0] if models else "")
+                self._model_changed()
+            self.status_var.set(
+                f"Подключено. Моделей: {len(models)}"
+                if models else "Модели не обнаружены"
+            )
+
+        self._background(available_models, finished)
+
+    def _timeout_seconds(self):
+        return {"2 мин": 120, "5 мин": 300, "10 мин": 600,
+                "20 мин": 1200, "30 мин": 1800}.get(
+            self.timeout_var.get(), DEFAULT_CHAT_TIMEOUT
+        )
+
+    def _chosen_model(self):
+        model = self.model_var.get()
+        if not model:
+            messagebox.showwarning(
+                "LocalChat",
+                "Загрузи модель в LM Studio и нажми «Обновить».",
+                parent=self.root,
+            )
+            return None
+        return model
+
+    def _send_and_break(self, event=None):
+        self.send()
+        return "break"
+
+    def send(self):
+        if self.busy:
+            return
+        question = self.input.get("1.0", "end-1c").strip()
+        if not question:
+            return
+        model = self._chosen_model()
+        if not model:
+            return
+
+        attachment = ""
+        if self.attach_var.get():
+            if self.file_path is None:
+                messagebox.showwarning(
+                    "LocalChat", "Сначала выбери Python-файл.", parent=self.root
+                )
+                return
+            try:
+                source, _, _ = load_python(self.file_path)
+                if len(source) > MAX_CODE_CHARS:
+                    raise ValueError("Код длиннее 80 000 символов")
+            except (OSError, ValueError, SyntaxError, UnicodeError) as exc:
+                messagebox.showerror("Чтение файла", str(exc), parent=self.root)
+                return
+            attachment = (
+                f"\n\nФайл {self.file_path.name}:\n```python\n{source}\n```"
+            )
+
+        content = question + attachment
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        messages.extend(
+            {"role": role, "content": txt}
+            for role, txt in self.history[-MAX_HISTORY_MESSAGES:]
+        )
+        messages.append({"role": "user", "content": content})
+        generation = self.generation
+        timeout_seconds = self._timeout_seconds()
+        self.status_var.set(
+            f"Модель отвечает (ожидание сети до {timeout_seconds // 60} мин)..."
+        )
+        self._add_message(
+            "Ты", question + ("\n[Приложен Python-файл]" if attachment else "")
+        )
+        self.input.delete("1.0", "end")
+
+        def finished(result, err):
+            if generation != self.generation:
+                self.status_var.set("Ответ предыдущего диалога отброшен")
+                return
+            if err:
+                self._add_message("Ошибка", err)
+                self.status_var.set("Ошибка запроса; статистика не обновлена")
+                return
+
+            answer = result["answer"]
+            self._update_stats(result)
+            self.history += [("user", content), ("assistant", answer)]
+            self.history = self.history[-MAX_HISTORY_MESSAGES:]
+            self._add_message("Local AI", answer)
+
+            if result["truncated"]:
+                self.status_var.set("Ответ обрезан: достигнут лимит токенов")
+            else:
+                self.status_var.set("Ответ получен")
+
+        self._background(
+            lambda: model_reply(model, messages, timeout=timeout_seconds), finished
+        )
+
+    def fix_from_chat(self):
+        if self.busy:
+            self.status_var.set("Сначала дождись предыдущего запроса")
+            return
+        if self.file_path is None:
+            messagebox.showinfo(
+                "Исправление", "Сначала выбери .py-файл.", parent=self.root
+            )
+            return
+
+        task = self.input.get("1.0", "end-1c").strip()
+        if not task:
+            messagebox.showinfo(
+                "Исправление",
+                "Напиши внизу, что требуется исправить.",
+                parent=self.root,
+            )
+            self.input.focus_set()
+            return
+        model = self._chosen_model()
+        if not model:
+            return
+
+        path = self.file_path
+        try:
+            original, original_raw, encoding = load_python(path)
+            if len(original) > MAX_CODE_CHARS:
+                raise ValueError("Файл слишком большой для исправления целиком")
+        except (OSError, ValueError, SyntaxError, UnicodeError) as exc:
+            messagebox.showerror("Чтение исходника", str(exc), parent=self.root)
+            return
+
+        prompt = [{"role": "system", "content": (
+            "Ты исправляешь один Python-файл по запросу пользователя "
+            "с учётом беседы. Верни ровно один ПОЛНЫЙ исходный текст "
+            "Python между отдельными строками "
+            f"{BEGIN} и {END}. Без Markdown и объяснений. Не запускай код. "
+            "Сохрани математические формулы, если пользователь не "
+            "потребовал изменить их. Окончательный актуальный исходник "
+            "дан в последнем сообщении."
+        )}]
+        prompt.extend(
+            {"role": role, "content": txt}
+            for role, txt in self.history[-MAX_HISTORY_MESSAGES:]
+        )
+        prompt.append({"role": "user", "content": (
+            f"Имя файла: {path.name}\nЗадача: {task}"
+            f"\n\nПОЛНЫЙ ИСХОДНИК:\n{original}"
+        )})
+
+        generation = self.generation
+        self._add_message("Ты", f"Исправить {path.name}: {task}")
+        timeout_seconds = self._timeout_seconds()
+        self.status_var.set(
+            f"LM Studio предлагает исправление (ожидание до {timeout_seconds // 60} мин); "
+            "файл не изменён"
+        )
+
+        def finished(result, err):
+            if generation != self.generation:
+                self.status_var.set("Устаревший ответ проигнорирован")
+                return
+            if err:
+                self._add_message("Ошибка", err)
+                self.status_var.set("Исправление не получено")
+                return
+
+            self._update_stats(result)
+            answer = result["answer"]
+            if result["truncated"]:
+                self._add_message("Local AI", answer)
+                self.status_var.set("Исправление обрезано; применение отменено")
+                messagebox.showwarning(
+                    "Ответ не применён",
+                    "Достигнут лимит ответа. Попроси исправить меньший файл.",
+                    parent=self.root,
+                )
+                return
+
+            try:
+                candidate = extract_fixed_code(answer, original)
+            except (SyntaxError, ValueError) as exc:
+                self._add_message("Local AI", answer)
+                messagebox.showwarning(
+                    "Ответ не применён", str(exc), parent=self.root
+                )
+                self.status_var.set("Не получен корректный полный Python-файл")
+                return
+
+            if candidate == original:
+                self.status_var.set("Изменений нет")
+                messagebox.showinfo(
+                    "Исправление", "Модель не предложила изменений.",
+                    parent=self.root,
+                )
+                return
+
+            self.status_var.set("Сравни изменения перед сохранением")
+            self._preview(path, original, original_raw, encoding, candidate)
+
+        self._background(
+            lambda: model_reply(
+                model, prompt, temperature=0.1, timeout=timeout_seconds
+            ), finished
+        )
+
+    def _preview(self, path, original, original_raw, encoding, candidate):
+        diff = "".join(difflib.unified_diff(
+            original.splitlines(keepends=True),
+            candidate.splitlines(keepends=True),
+            fromfile="Оригинал", tofile="LM Studio", n=3,
+        ))
+        win = tk.Toplevel(self.root)
+        win.title("Проверка исправления — файл НЕ изменён")
+        win.geometry("920x610")
+        ttk.Label(
+            win,
+            text="Проверь изменения. Запись — только после подтверждения.",
+        ).pack(padx=10, pady=8)
+
+        view = scrolledtext.ScrolledText(
+            win, font=("Consolas", 10), wrap="none"
+        )
+        view.pack(fill="both", expand=True, padx=8)
+        view.insert("1.0", diff or "Отличается завершающий перенос строки")
+        view.configure(state="disabled")
+
+        controls = ttk.Frame(win, padding=8)
+        controls.pack(fill="x")
+        ttk.Button(
+            controls, text="Копировать diff", command=lambda: self.copy(diff)
+        ).pack(side="left")
+        ttk.Button(
+            controls, text="Отмена", command=win.destroy
+        ).pack(side="right", padx=5)
+
+        def apply():
+            if not messagebox.askyesno(
+                "Подтверждение",
+                f"Создать резервную копию и записать исправление в:\n{path}?",
+                parent=win,
+            ):
+                return
+            try:
+                backup = safe_write_with_backup(
+                    path, original_raw, candidate, encoding
+                )
+            except (OSError, RuntimeError, UnicodeError) as exc:
+                messagebox.showerror("Запись отменена", str(exc), parent=win)
+                return
+            win.destroy()
+            self.status_var.set("Файл исправлен; резервная копия сохранена")
+            messagebox.showinfo(
+                "Готово",
+                f"Файл записан:\n{path}\n\nРезервная копия:\n{backup}",
+                parent=self.root,
+            )
+
+        ttk.Button(
+            controls, text="Применить к файлу", command=apply
+        ).pack(side="right", padx=5)
+
+    def close(self):
+        self.closed = True
+        self.generation += 1
+        self.root.destroy()
+
+
+def main():
+    root = tk.Tk()
+    app = LocalChat(root)
+    app.input.focus_set()
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
